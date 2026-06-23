@@ -1,0 +1,227 @@
+<div align="center">
+
+# 🎙️ EGY-Emilia
+
+### End-to-end pipeline for building **clean, single-speaker** Egyptian-Arabic TTS datasets
+
+*From a list of YouTube links to quality-scored, transcribed, training-ready audio chunks — one command.*
+
+![python](https://img.shields.io/badge/python-3.11-blue)
+![torch](https://img.shields.io/badge/torch-2.7.1%20cu126-ee4c2c)
+![nemo](https://img.shields.io/badge/NeMo-2.7.3-76b900)
+![gpu](https://img.shields.io/badge/GPU-H100-success)
+
+</div>
+
+---
+
+## ✨ What it does
+
+EGY-Emilia turns raw long-form audio into a **TTS-grade corpus** where every chunk is
+**one speaker, no overlap, 3–30 s, cleanly cut, loudness-normalized, quality-scored,
+and transcribed** (Egyptian Arabic with English **code-switching** preserved).
+
+```
+🔗 sources.txt ─▶ ⬇️ download ─▶ ✂️ diarize+chunk ─▶ 🔊 loudness ─▶ 📊 quality ─▶ 📝 transcribe
+                                                                            │
+                                                          chunks.json ◀─────┤
+                                                    chunks_clean.json ◀──────┘  (+ text)
+```
+
+| # | Stage | What happens | Output |
+|---|-------|--------------|--------|
+| 1️⃣ | **Download** | yt-dlp expands channels/playlists/videos → audio at target SR/format | `input_audios/*.mp3` |
+| 2️⃣ | **Diarize + Chunk** | Silero VAD ∩ Sortformer ∩ TitaNet purity gate → pure single-speaker chunks | `output/<id>/chunks/` |
+| 3️⃣ | **Loudness** | EBU R128 normalization (ffmpeg `loudnorm`) | chunks normalized in place |
+| 4️⃣ | **Quality** | per-chunk UTMOS + DNSMOS + music/noise → `overall` score & filtering | `chunks.json`, `chunks_clean.json` |
+| 5️⃣ | **Transcribe** | Egyptian-Arabic ASR w/ code-switching on **clean** chunks | `text` in `chunks_clean.json` |
+
+> 🧩 **Everything is driven by [`config.yaml`](config.yaml).** No CLI args anywhere.
+> 🔁 **Every stage is resumable** — interrupt any time, re-run, and it continues where it stopped.
+
+---
+
+## 🧠 Why this design (vs. plain pyannote)
+
+Single-speaker **purity** is the hard constraint for TTS, so no single model is trusted alone:
+
+| Stage | Tool | Job |
+|-------|------|-----|
+| VAD | **Silero VAD** | speech/silence edges → no mid-word cuts, natural split points |
+| Diarization | **NeMo Sortformer** (`diar_streaming_sortformer_4spk-v2`) | per-frame *who*, **including overlap**. End-to-end → far better than pyannote on Arabic |
+| Intersection | *(our logic)* | keep only runs that are in-speech **and** single-speaker with **zero overlap**; bridge brief same-speaker gaps for longer chunks |
+| Purity gate | **TitaNet** | re-embed each chunk; reject if a 2nd voice leaked in |
+
+---
+
+## 🚀 Setup (H100 pod)
+
+> 📁 Mount: `/mnt/storage/tts/m.aly` · Run from: `/home/workspace/m.aly/test asr diarization`
+
+> 🟢 **Python 3.11** — NeMo pulls `transformers~=4.57` → `tokenizers>=0.22`, which has **no wheels for 3.13**.
+> 3.11 has the widest wheel coverage and avoids `ResolutionImpossible`.
+
+> 🎛️ **CUDA note** — the pod's `nvidia-smi` shows `CUDA 12.2`, but CUDA 12.x is **forward-compatible
+> across minor versions** (driver only needs to beat `525.60.13`). PyTorch dropped `cu121` after 2.5.1,
+> so torch 2.7 comes from the **`cu126`** index — and runs fine here.
+
+```bash
+cd "/home/workspace/m.aly/test asr diarization"
+
+# 1) conda env (Python 3.11)
+conda create -n egy python=3.11 -y
+conda activate egy
+pip install --upgrade pip setuptools wheel
+
+# 2) PyTorch 2.7.1 + torchaudio (cu126)
+pip install torch==2.7.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu126
+
+# 3) pipeline deps
+pip install -r requirements.txt
+
+# 4) NeMo (Sortformer diarizer + TitaNet + EgypTalk ASR backend)
+pip install "nemo_toolkit[asr]==2.7.3"
+
+# 5) ffmpeg must be on PATH (download/encode + loudnorm)
+conda install -c conda-forge ffmpeg -y   # or: apt-get install -y ffmpeg
+```
+
+> ℹ️ First run downloads model checkpoints from HuggingFace → the pod needs network access
+> (or pre-cache and set `HF_HOME`).
+
+---
+
+## ⚙️ Configure
+
+Open [`config.yaml`](config.yaml) and set what you need. Highlights:
+
+```yaml
+download:
+  audio_format: "mp3"      # 🎵 mp3 (smaller) or wav
+  sample_rate: 24000       # 🎚️ default 24 kHz
+  channels: 1              # mono
+
+quality:
+  filter_threshold: 2.8    # ✅ chunks with overall >= this → chunks_clean.json
+
+asr:
+  backend: "egyptalk"      # 🗣️ "egyptalk" (NeMo) | "seamless" (Meta M4T v2)
+  preserve_english: true   # 🔤 keep code-switched English terms in Latin script
+```
+
+Then add your links to [`sources.txt`](sources.txt) (channels, playlists, or videos — any mix).
+
+---
+
+## ▶️ Run
+
+**Whole pipeline (recommended):**
+```bash
+python run_pipeline.py
+```
+
+**One stage at a time** — edit `STAGE` at the top of `run_stage.py`, then:
+```bash
+python run_stage.py        # STAGE = "download" | "diarize" | "loudness" | "quality" | "transcribe"
+```
+
+**Just downloading:**
+```bash
+python download.py
+```
+
+You'll get colored, live **progress bars with spinners** (via `rich`) for every stage. 🌈
+
+---
+
+## 📦 Output layout
+
+```
+output/
+├── <audio_id>/
+│   ├── chunks/                 🎧 chunk_00001_spk0.mp3, ...
+│   ├── manifest.csv            path, speaker, start, end, duration
+│   └── manifest.jsonl
+├── chunks.json                 📊 ALL chunks + duration + quality sub-scores + overall
+├── chunks_clean.json           ✅ chunks with overall >= filter_threshold (+ transcriptions)
+└── transcripts.json            📝 path → text
+```
+
+Example `chunks.json` record:
+```json
+{
+  "chunk_path": "audio_4axSKMfXHlE/chunks/chunk_00007_spk1.mp3",
+  "speaker": "speaker_1", "start": 41.2, "end": 61.6, "duration": 20.4,
+  "scores": { "utmos": 4.12, "dnsmos_ovrl": 3.71, "cleanliness": 0.97 },
+  "overall": 3.83,
+  "text": "أنا شغال على الـ startup دي من سنتين"
+}
+```
+
+At the end of **Stage 4** you'll see:
+```
+ℹ total audio:  12.40 h  (3812 chunks)
+ℹ clean (>= 2.8): 9.10 h  (2790 chunks)
+```
+
+---
+
+## 🔁 Resuming
+
+Each stage keeps a checkpoint under `.state/`:
+
+| Stage | Resume mechanism |
+|-------|------------------|
+| download | yt-dlp download-archive + `download.json` |
+| diarize | per-audio `diarize.json` (skips finished audios) |
+| loudness | per-chunk `loudness.json` |
+| quality | `quality_cache.json` (per-chunk scores) |
+| transcribe | checkpoints `chunks_clean.json` after every batch |
+
+Interrupt with `Ctrl-C` and just re-run — finished work is skipped. 🟢
+
+---
+
+## 🗣️ ASR backends (pluggable)
+
+Egyptian Arabic + code-switching is genuinely hard, and generic/fine-tuned Whisper
+variants underperform on it. EGY-Emilia keeps ASR **pluggable** via `asr.backend`:
+
+- **`qwencleo`** *(default)* — [`mohammedaly22/QwenCleo-ASR`](https://huggingface.co/mohammedaly22/QwenCleo-ASR),
+  a **Qwen3-ASR-1.7B** model purpose-built for Egyptian Arabic + Arabic/English
+  code-switching. Near-perfect on podcasts; keeps English in Latin script.
+- **`whisper`** — Whisper large-v3 family; keeps code-switched English in Latin script.
+- **`egyptalk`** — `NAMAA-Space/EgypTalk-ASR-v2`, NeMo FastConformer (Arabic script only).
+- **`seamless`** — `facebook/seamless-m4t-v2-large`, Egyptian Arabic (`arz`).
+
+Switch via `asr.backend` in the config — no code changes.
+
+### Installing the default (QwenCleo-ASR)
+
+```bash
+# torch is already installed (Setup step 2). Then:
+pip install qwencleo-asr --no-deps
+pip install "qwen-asr>=0.0.6"
+```
+`--no-deps` keeps qwencleo-asr from re-resolving torch/transformers against our pinned
+stack. First run downloads `mohammedaly22/QwenCleo-ASR` from HuggingFace.
+
+> ⚠️ Model availability shifts; if a checkpoint 404s, swap it in `config.yaml`
+> (`asr.egyptalk_model` / `asr.seamless_model` / `asr.whisper_model`).
+
+---
+
+## 🧰 Tuning for longer / purer chunks
+
+| Want | Change in `config.yaml` |
+|------|--------------------------|
+| 📏 Longer chunks | ↑ `diarization.bridge_gap_s` (e.g. `1.0`), ↑ `target_chunk_s` |
+| 🧼 Purer chunks | ↑ `embedding_threshold` (e.g. `0.6`), ↑ `boundary_margin_s` |
+| ✂️ No clipped words | ↑ `speech_pad_ms`, ↑ `tail_pad_s` |
+| ✅ Stricter clean set | ↑ `quality.filter_threshold` |
+
+---
+
+<div align="center">
+<sub>Built for TTS data collection · single-speaker purity over quantity 🎯</sub>
+</div>

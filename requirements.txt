@@ -1,0 +1,40 @@
+# Install AFTER torch (see README step 2). Order matters: torch first from the
+# cu126 wheel index, then these, then nemo_toolkit[asr] last.
+#
+# Stack: Python 3.12, torch==2.7.1 (cu126; cu121 wheels stop at torch 2.5.1, and
+#        CUDA 12.x is forward-compatible on this pod's 12.2 driver),
+#        nemo_toolkit[asr]==2.7.3
+#
+# torch / torchaudio are installed separately in README step 2 (CUDA wheel index),
+# so they are intentionally NOT pinned here.
+
+# --- core audio / pipeline ---
+soundfile>=0.12
+librosa>=0.10
+silero-vad>=5.1
+numpy>=1.24
+PyYAML>=6.0
+
+# --- CLI / UX ---
+rich>=13.7            # colored console, spinners, progress bars
+tqdm>=4.66            # used inside diarize_chunk.py
+
+# --- download ---
+yt-dlp>=2024.0        # YouTube channels / playlists / videos (needs ffmpeg on PATH)
+
+# --- quality scoring (all OPTIONAL; pipeline degrades gracefully if missing) ---
+# UTMOS pulls from torch.hub at runtime (no pin needed)
+transformers>=4.40    # music/noise tagger + Whisper/Seamless ASR backends
+accelerate>=0.26      # speeds up Whisper pipeline on GPU
+# Default ASR backend (QwenCleo-ASR). Install separately, see README:
+#   pip install qwencleo-asr --no-deps
+#   pip install "qwen-asr>=0.0.6"
+# (kept out of this file so pip doesn't resolve qwencleo-asr's deps against our stack)
+narwhals>=1.0         # required by recent sklearn; missing it breaks the whole
+                      # sklearn->transformers->torchmetrics->lightning->nemo import chain
+# torchaudio provides SQUIM (DNSMOS proxy); installed with torch in README step 2
+
+# nemo_toolkit[asr] is installed separately in README step 4
+# (provides Sortformer diarization + TitaNet + EgypTalk ASR backend).
+#
+# System dependency: ffmpeg must be on PATH (audio extract/encode + loudnorm).

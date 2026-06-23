@@ -1,0 +1,114 @@
+# ============================================================================
+#  EGY-Emilia — central configuration
+#  Edit this file ONLY. Every script reads from here (no CLI args anywhere).
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Paths — everything is relative to the repo root unless absolute.
+# ----------------------------------------------------------------------------
+paths:
+  sources_file: "sources.txt"        # YouTube channels / playlists / videos, one per line
+  input_audios: "input_audios"       # where downloaded long audios land
+  output: "output"                   # per-audio subfolders with chunks + manifests
+  state_dir: ".state"                # resume/checkpoint bookkeeping
+
+# ----------------------------------------------------------------------------
+# 1) DOWNLOAD  (download.py)
+# ----------------------------------------------------------------------------
+download:
+  audio_format: "mp3"                # mp3 (smaller) or wav
+  sample_rate: 24000                 # target SR for downloaded audio
+  channels: 1                        # 1 = mono, 2 = stereo
+  mp3_bitrate: "192k"                # only used when audio_format == mp3
+  # yt-dlp tuning
+  concurrent_downloads: 3            # parallel video downloads
+  retries: 10
+  ignore_errors: true                # skip a video that fails, keep going
+  cookies_file: null                 # path to cookies.txt for age/region-gated content, or null
+
+# ----------------------------------------------------------------------------
+# 2) DIARIZE + CHUNK  (run on every input audio)
+#    NOTE: the heavy logic lives in diarize_chunk.py; these mirror its Config.
+# ----------------------------------------------------------------------------
+diarization:
+  diar_model: "nvidia/diar_streaming_sortformer_4spk-v2"
+  # chunk length window
+  min_chunk_s: 5.0
+  target_chunk_s: 22.0               # splitter aims here; raise toward max for longer
+  max_chunk_s: 30.0
+  # longer-chunk levers
+  bridge_gap_s: 0.6                  # absorb tiny same-speaker interruptions
+  bridge_overlap_s: 0.0
+  # MERGE adjacent same-speaker regions separated only by silence (no other
+  # speaker / no overlap) up to this gap. THE main lever for long chunks on
+  # single-speaker video. Splitter still cuts the merged region at silences.
+  merge_gap_s: 8.0
+  # no clipped word ends
+  speech_pad_ms: 250
+  tail_pad_s: 0.15
+  min_silence_ms: 700
+  # VAD / diarization sensitivity
+  vad_threshold: 0.5
+  diar_threshold: 0.5
+  boundary_margin_s: 0.20
+  # purity gate (TitaNet) — diarization ALREADY ensures single-speaker, so this is
+  # just a light safety net. It now compares each 3s window to the chunk centroid
+  # and rejects only clear outliers (a real 2nd voice ~0.5-0.7; same speaker ~0.85+).
+  # Keep threshold LOW so normal phonetic variation isn't rejected.
+  embedding_check: true
+  embedding_threshold: 0.40
+  # output audio
+  write_sr: 24000                    # chunks are written at this SR
+  write_format: "mp3"                # mp3 or wav
+  mp3_bitrate: "192k"
+
+# ----------------------------------------------------------------------------
+# 3) LOUDNESS NORMALIZATION
+# ----------------------------------------------------------------------------
+loudness:
+  enabled: true
+  target_lufs: -23.0                 # EBU R128 integrated loudness target
+  true_peak: -1.5                    # dBTP ceiling
+  lra: 11.0                          # loudness range
+
+# ----------------------------------------------------------------------------
+# 4) QUALITY SCORING  (per chunk)  ->  chunks.json
+#    Any scorer whose model isn't installed is skipped and noted (graceful).
+# ----------------------------------------------------------------------------
+quality:
+  dnsmos: true                       # DNSMOS P.835 (OVRL/SIG/BAK)
+  utmos: true                        # UTMOS naturalness MOS
+  music_noise: true                  # background music / noise / SFX detection
+  # how the single "overall" score is combined from sub-scores (weights need not sum to 1)
+  weights:
+    utmos: 1.0
+    dnsmos_ovrl: 1.0
+    cleanliness: 1.0                 # 1 - music/noise presence
+  # filtering — gate on ONE decisive metric (not the blended "overall", which can
+  # let noisy/laughter/multi-voice chunks through). Default: DNSMOS overall.
+  filter_metric: "dnsmos_ovrl"       # dnsmos_ovrl | utmos | overall
+  filter_threshold: 2.8              # keep chunks with filter_metric >= this
+
+# ----------------------------------------------------------------------------
+# 5) TRANSCRIPTION  (clean chunks only)
+# ----------------------------------------------------------------------------
+asr:
+  # "qwencleo" -> QwenCleo-ASR (Qwen3-ASR-1.7B), Egyptian Arabic + code-switching (DEFAULT)
+  # "whisper"  -> Whisper large-v3 family, English kept in Latin script
+  # "egyptalk" -> NeMo FastConformer, best pure-Egyptian but Arabic-script only
+  # "seamless" -> Meta M4T v2 (arz)
+  backend: "qwencleo"
+  qwencleo_language: "Arabic"        # "Arabic" anchors dialect; null/"auto" = auto-detect
+  whisper_model: "openai/whisper-large-v3"
+  egyptalk_model: "NAMAA-Space/EgypTalk-ASR-v2"
+  seamless_model: "facebook/seamless-m4t-v2-large"
+  batch_size: 8
+  # code-switching: keep Latin-script English terms as-is in the output
+  preserve_english: true
+
+# ----------------------------------------------------------------------------
+# Runtime
+# ----------------------------------------------------------------------------
+runtime:
+  device: "cuda"                     # cuda | cpu
+  seed: 1234
