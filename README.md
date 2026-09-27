@@ -123,6 +123,12 @@ makes no request to YouTube.
 PO tokens help a lot, but YouTube can still hard-block a particular datacenter IP. Fallbacks,
 none of which use cookies:
 
+0. **Find a player client that still works from this IP** (free, 1 minute):
+   ```bash
+   python scripts/diagnose_youtube.py
+   ```
+   It tries each YouTube client (tv, web_embedded, android_vr, …). If one works, it prints an
+   `extractor_args:` line to paste under `download:` in `config.yaml`.
 1. **Download at home, process on the pod** (always works: home IPs aren't blocked).
    On your PC (Python + ffmpeg + deno installed):
    ```bash

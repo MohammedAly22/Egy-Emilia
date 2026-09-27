@@ -40,6 +40,15 @@ def _clean(msg) -> str:
     return escape(_ANSI.sub("", str(msg)).strip())
 
 
+class _Silent:
+    """yt-dlp logger that drops everything: errors reach us as exceptions and
+    are reported once, cleanly, instead of also as raw 'ERROR:' lines."""
+    def debug(self, msg): pass
+    def info(self, msg): pass
+    def warning(self, msg): pass
+    def error(self, msg): pass
+
+
 def _is_bot_block(msg: str) -> bool:
     m = msg.lower()
     return any(s in m for s in _BOT_MARKERS)
@@ -162,6 +171,7 @@ def _base_opts(dl_cfg, cookies: Path | None) -> dict:
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,              # our rich bar is the progress display
+        "logger": _Silent(),
         # pace metadata requests; bursts are what trip the bot check
         "sleep_interval_requests": getattr(dl_cfg, "sleep_requests_s", 1),
     }
@@ -283,6 +293,7 @@ def _bot_help(cookies: Path | None, pot_running: bool) -> None:
         note("your cookies were rejected — re-export them (README → YouTube on RunPod).")
     else:
         note("this pod's IP is flagged even with PO tokens. Options (README → YouTube on RunPod):")
+        note("  0. python scripts/diagnose_youtube.py  (finds a player client that still works)")
         note("  1. download on your home PC and send input_audios/ to the pod (runpodctl)")
         note("  2. set download.proxy to a residential proxy")
         note("  3. restart on a different pod / region (new IP) and re-run")
