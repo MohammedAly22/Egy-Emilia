@@ -1,0 +1,13 @@
+# secrets — NEVER commit
+cookies.txt
+*.cookies.txt
+.env
+
+# data / pipeline outputs
+input_audios/
+output/
+hf_dataset/
+.state/
+
+__pycache__/
+*.pyc

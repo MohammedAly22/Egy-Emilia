@@ -22,7 +22,7 @@ EGY-Emilia turns raw long-form audio into a **TTS-grade corpus** where every chu
 and transcribed** (Egyptian Arabic with English **code-switching** preserved).
 
 ```
-🔗 sources.txt ─▶ ⬇️ download ─▶ ✂️ diarize+chunk ─▶ 🔊 loudness ─▶ 📊 quality ─▶ 📝 transcribe
+🔗 sources.txt ─▶ ⬇️ download ─▶ ✂️ diarize+chunk ─▶ 🔊 loudness ─▶ 📊 quality ─▶ 📝 transcribe ─▶ 🤗 publish
                                                                             │
                                                           chunks.json ◀─────┤
                                                     chunks_clean.json ◀──────┘  (+ text)
@@ -35,6 +35,7 @@ and transcribed** (Egyptian Arabic with English **code-switching** preserved).
 | 3️⃣ | **Loudness** | EBU R128 normalization (ffmpeg `loudnorm`) | chunks normalized in place |
 | 4️⃣ | **Quality** | per-chunk UTMOS + DNSMOS + music/noise → `overall` score & filtering | `chunks.json`, `chunks_clean.json` |
 | 5️⃣ | **Transcribe** | Egyptian-Arabic ASR w/ code-switching on **clean** chunks | `text` in `chunks_clean.json` |
+| 6️⃣ | **Publish** | clean + transcribed chunks → **private** HuggingFace dataset | `hf_dataset/` → `huggingface.co/datasets/<repo_id>` |
 
 > 🧩 **Everything is driven by [`config.yaml`](config.yaml).** No CLI args anywhere.
 > 🔁 **Every stage is resumable** — interrupt any time, re-run, and it continues where it stopped.
@@ -84,7 +85,42 @@ pip install "nemo_toolkit[asr]==2.7.3"
 
 # 5) ffmpeg must be on PATH (download/encode + loudnorm)
 conda install -c conda-forge ffmpeg -y   # or: apt-get install -y ffmpeg
+
+# 6) deno — yt-dlp needs a JS runtime to solve YouTube's player challenges
+conda install -c conda-forge deno -y
+
+# 7) HuggingFace login (for the publish stage; token needs WRITE access)
+hf auth login                            # or: export HF_TOKEN=hf_xxx
 ```
+
+---
+
+## 🍪 YouTube cookies (required on RunPod / any cloud GPU)
+
+YouTube blocks datacenter IPs with **"Sign in to confirm you're not a bot"**. The fix is
+to send the cookies of a logged-in YouTube session with every request.
+
+> 🔐 Use a **secondary / throwaway Google account**. Heavy downloading with cookies can
+> get the account rate-limited. `cookies.txt` is in `.gitignore` — **never commit it**.
+
+1. On your **local PC**, open a **private / incognito** window and log in to YouTube.
+2. In that same window go to `https://www.youtube.com/robots.txt` (keep it the only tab).
+3. Export cookies for youtube.com in **Netscape format**, either with the
+   *Get cookies.txt LOCALLY* browser extension (allow it in incognito), or with
+   `yt-dlp --cookies-from-browser chrome --cookies cookies.txt --skip-download "https://www.youtube.com/watch?v=4axSKMfXHlE"`.
+4. **Close the private window right away**, otherwise YouTube rotates the cookies and
+   the exported ones stop working.
+5. Upload `cookies.txt` to the repo root on the pod (Jupyter upload, or
+   `scp -P <port> cookies.txt root@<pod-ip>:/workspace/Egy-Emilia/`).
+
+`config.yaml → download.cookies_file: "cookies.txt"` is already set. The download
+stage validates the file, paces requests (`sleep_min_s` / `sleep_max_s`), and after
+`bot_abort_after` consecutive bot blocks it **stops with instructions** instead of
+failing all remaining videos. When that happens, re-export the cookies (steps 1–5) and re-run:
+finished videos are checkpointed.
+
+Single-video links (`youtu.be/…`, `watch?v=…`) are parsed locally, so expanding them
+makes no request to YouTube.
 
 > ℹ️ First run downloads model checkpoints from HuggingFace → the pod needs network access
 > (or pre-cache and set `HF_HOME`).
@@ -107,6 +143,10 @@ quality:
 asr:
   backend: "egyptalk"      # 🗣️ "egyptalk" (NeMo) | "seamless" (Meta M4T v2)
   preserve_english: true   # 🔤 keep code-switched English terms in Latin script
+
+publish:
+  repo_id: "mohammedaly22/Egy-Emilia"   # 🤗 <user-or-org>/<dataset-name>
+  private: true                         # 🔒 only you can see it
 ```
 
 Then add your links to [`sources.txt`](sources.txt) (channels, playlists, or videos — any mix).
@@ -122,7 +162,7 @@ python run_pipeline.py
 
 **One stage at a time** — edit `STAGE` at the top of `run_stage.py`, then:
 ```bash
-python run_stage.py        # STAGE = "download" | "diarize" | "loudness" | "quality" | "transcribe"
+python run_stage.py        # STAGE = "download" | "diarize" | "loudness" | "quality" | "transcribe" | "publish"
 ```
 
 **Just downloading:**
@@ -166,17 +206,41 @@ At the end of **Stage 4** you'll see:
 
 ---
 
+## 🤗 Publishing to HuggingFace (private)
+
+The last pipeline stage uploads every chunk in `chunks_clean.json` **that has a
+transcription** to `publish.repo_id` as a **private** dataset (visibility is enforced
+even if the repo already exists). It is laid out as an HF *audiofolder*:
+
+```
+hf_dataset/                       (hardlinks to output/, no extra disk)
+├── README.md                     dataset card
+├── metadata.jsonl                file_name, text, duration, speaker, source_id, start, end, scores, overall
+└── audio/<video_id>/chunk_*.mp3
+```
+
+The upload uses `upload_large_folder`, so it is resumable: if it is interrupted, re-run
+`publish`. Load the dataset with:
+
+```python
+from datasets import load_dataset
+ds = load_dataset("mohammedaly22/Egy-Emilia", split="train", token=True)
+```
+
+---
+
 ## 🔁 Resuming
 
 Each stage keeps a checkpoint under `.state/`:
 
 | Stage | Resume mechanism |
 |-------|------------------|
-| download | yt-dlp download-archive + `download.json` |
+| download | `download.json` (a video is marked done only once its audio file exists) |
 | diarize | per-audio `diarize.json` (skips finished audios) |
 | loudness | per-chunk `loudness.json` |
 | quality | `quality_cache.json` (per-chunk scores) |
 | transcribe | checkpoints `chunks_clean.json` after every batch |
+| publish | `upload_large_folder` resumes from its cache in `hf_dataset/.cache` |
 
 Interrupt with `Ctrl-C` and just re-run — finished work is skipped. 🟢
 

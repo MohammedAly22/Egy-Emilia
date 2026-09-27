@@ -2,15 +2,41 @@
 
 Reads a text file of URLs (any mix of channel, playlist, single video), expands
 them to individual videos, and downloads audio at the configured format / SR /
-channels into input_audios/. Resumable: yt-dlp's download-archive plus our own
-checkpoint mean re-running only fetches what's missing.
+channels into input_audios/. Resumable: our own checkpoint means re-running
+only fetches what's missing.
+
+Cloud IPs (RunPod, k8s, …) are routinely hit by YouTube's "Sign in to confirm
+you're not a bot" check. The fix is a cookies.txt exported from a logged-in
+browser (see README → "YouTube cookies"). This stage validates that file, paces
+its requests, and stops early with instructions if YouTube keeps blocking it.
 """
 
+import re
+import shutil
+from datetime import date, datetime
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+from rich.markup import escape
 
 from .config import resolve
 from .state import Checkpoint
 from .ui import banner, console, err, info, note, ok, progress, warn
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_BOT_MARKERS = ("sign in to confirm", "not a bot", "cookies", "http error 403",
+                "http error 429", "too many requests")
+
+
+def _clean(msg) -> str:
+    """Strip yt-dlp's ANSI colors and escape rich markup ('[youtube]' etc.)."""
+    return escape(_ANSI.sub("", str(msg)).strip())
+
+
+def _is_bot_block(msg: str) -> bool:
+    m = msg.lower()
+    return any(s in m for s in _BOT_MARKERS)
 
 
 def _read_sources(path: Path) -> list[str]:
@@ -22,28 +48,132 @@ def _read_sources(path: Path) -> list[str]:
     return urls
 
 
-def _expand(urls: list[str], dl_cfg) -> list[dict]:
+def _video_id(url: str) -> str | None:
+    """Return the video id of a single-video URL, or None for channels/playlists.
+
+    Parsing locally means single videos need NO network call during expansion —
+    that call is exactly what triggers YouTube's bot check on cloud IPs.
+    """
+    u = urlparse(url if "://" in url else f"https://{url}")
+    host = (u.hostname or "").lower().removeprefix("www.").removeprefix("m.")
+    parts = [p for p in u.path.split("/") if p]
+    vid = None
+    if host == "youtu.be" and parts:
+        vid = parts[0]
+    elif host.endswith("youtube.com"):
+        if parts[:1] == ["watch"]:
+            vid = parse_qs(u.query).get("v", [None])[0]
+        elif len(parts) >= 2 and parts[0] in ("shorts", "live", "embed", "v"):
+            vid = parts[1]
+    return vid if vid and _VIDEO_ID.match(vid) else None
+
+
+def _cookie_file(dl_cfg) -> Path | None:
+    """Resolve + sanity-check download.cookies_file. Returns None if unusable."""
+    if not getattr(dl_cfg, "cookies_file", None):
+        warn("no cookies_file set — YouTube will likely block a cloud IP (bot check).")
+        return None
+    p = resolve(dl_cfg.cookies_file)
+    if not p.exists():
+        warn(f"cookies file not found: {p}")
+        note("export it from a logged-in browser and upload it there (README → YouTube cookies)")
+        return None
+    text = p.read_text(encoding="utf-8", errors="ignore")
+    first = text.lstrip().splitlines()[0] if text.strip() else ""
+    if "HTTP Cookie File" not in first:
+        warn(f"{p.name} is not in Netscape cookies.txt format — yt-dlp will reject it.")
+        note("use the 'Get cookies.txt LOCALLY' extension, or yt-dlp --cookies-from-browser")
+        return None
+    if "youtube.com" not in text:
+        warn(f"{p.name} contains no youtube.com cookies — export while on youtube.com")
+        return None
+    ok(f"using cookies: [accent]{p}[/accent]")
+    return p
+
+
+def _preflight() -> None:
+    """Warn about the two other common causes of YouTube failures."""
+    # YouTube now needs a JS runtime to solve its player challenges; deno is
+    # what yt-dlp enables by default.
+    if not shutil.which("deno"):
+        warn("deno not found on PATH — yt-dlp needs it to solve YouTube's JS challenges.")
+        note("install it:  conda install -c conda-forge deno -y")
+    # YouTube changes constantly; an old yt-dlp is the #1 cause of breakage.
+    try:
+        from yt_dlp.version import __version__ as v
+        age = (date.today() - datetime.strptime(v[:10], "%Y.%m.%d").date()).days
+        if age > 45:
+            warn(f"yt-dlp {v} is {age} days old — YouTube breaks old versions.")
+            note('update it:  pip install -U "yt-dlp[default]"')
+    except Exception:
+        pass
+
+
+def _base_opts(dl_cfg, cookies: Path | None) -> dict:
+    """Options shared by expansion and download (auth, proxy, pacing)."""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        # pace metadata requests; bursts are what trip the bot check
+        "sleep_interval_requests": getattr(dl_cfg, "sleep_requests_s", 1),
+    }
+    if cookies:
+        opts["cookiefile"] = str(cookies)
+    if getattr(dl_cfg, "proxy", None):
+        opts["proxy"] = dl_cfg.proxy
+    extractor_args = getattr(dl_cfg, "extractor_args", None)
+    if extractor_args:
+        # config gives {youtube: {player_client: "tv,web"}}; yt-dlp wants lists
+        opts["extractor_args"] = {
+            ie: {k: (v if isinstance(v, list) else str(v).split(","))
+                 for k, v in vars(args).items()}
+            for ie, args in vars(extractor_args).items()
+        }
+    return opts
+
+
+def _expand(urls: list[str], dl_cfg, cookies: Path | None) -> list[dict]:
     """Flatten channels/playlists into individual {id, title, url} video entries."""
     import yt_dlp
 
     flat = []
     seen = set()
+
+    def add(vid, title=None):
+        if vid and vid not in seen:
+            seen.add(vid)
+            # Always download via the canonical watch URL built from the video id.
+            # The flat-extraction "url" can be a resolved STREAM url (googlevideo),
+            # which makes yt-dlp skip metadata and name the file after the huge url.
+            flat.append({"id": vid, "title": title or vid,
+                         "url": f"https://www.youtube.com/watch?v={vid}"})
+
+    remote = []
+    for url in urls:
+        vid = _video_id(url)
+        if vid:
+            add(vid)                 # single video: no network needed
+        else:
+            remote.append(url)
+
+    if not remote:
+        return flat
+
     opts = {
-        "quiet": True,
-        "no_warnings": True,
+        **_base_opts(dl_cfg, cookies),
         "extract_flat": "in_playlist",   # list entries without downloading
         "ignoreerrors": dl_cfg.ignore_errors,
     }
-    if dl_cfg.cookies_file:
-        opts["cookiefile"] = dl_cfg.cookies_file
-
     with yt_dlp.YoutubeDL(opts) as ydl:
-        for url in urls:
+        for url in remote:
             note(f"resolving {url}")
             try:
                 data = ydl.extract_info(url, download=False)
             except Exception as e:
-                err(f"could not resolve {url}: {e}")
+                err(f"could not resolve {url}: {_clean(e)}")
+                continue
+            if not data:
+                err(f"could not resolve {url}")
                 continue
             entries = data.get("entries") if isinstance(data, dict) else None
             if entries is None:                      # single video
@@ -56,22 +186,11 @@ def _expand(urls: list[str], dl_cfg) -> list[dict]:
                 if e.get("entries"):
                     stack.extend(e["entries"])
                     continue
-                vid = e.get("id")
-                if not vid or vid in seen:
-                    continue
-                seen.add(vid)
-                # Always download via the canonical watch URL built from the video id.
-                # The flat-extraction "url" can be a resolved STREAM url (googlevideo),
-                # which makes yt-dlp skip metadata and name the file after the huge url.
-                flat.append({
-                    "id": vid,
-                    "title": e.get("title") or vid,
-                    "url": f"https://www.youtube.com/watch?v={vid}",
-                })
+                add(e.get("id"), e.get("title"))
     return flat
 
 
-def _ydl_opts(out_dir: Path, dl_cfg) -> dict:
+def _ydl_opts(out_dir: Path, dl_cfg, cookies: Path | None) -> dict:
     pp = [{
         "key": "FFmpegExtractAudio",
         "preferredcodec": dl_cfg.audio_format,
@@ -79,19 +198,22 @@ def _ydl_opts(out_dir: Path, dl_cfg) -> dict:
     }]
     # force SR + channel count via ffmpeg post-args
     postargs = ["-ar", str(dl_cfg.sample_rate), "-ac", str(dl_cfg.channels)]
-    opts = {
+    return {
+        **_base_opts(dl_cfg, cookies),
         "format": "bestaudio/best",
         # name strictly by video id; trim_file_name guards against any long fallback
         "outtmpl": str(out_dir / "%(id)s.%(ext)s"),
         "trim_file_name": 100,
         "restrictfilenames": True,
         "windowsfilenames": True,             # also forbids '?' etc. in names
-        "quiet": True,
-        "no_warnings": True,
         # We handle per-video errors ourselves (try/except below) so the actual
         # failure reason is surfaced instead of being silently swallowed.
         "ignoreerrors": False,
         "retries": dl_cfg.retries,
+        "fragment_retries": dl_cfg.retries,
+        # random pause between videos — keeps a cookie'd account from being flagged
+        "sleep_interval": getattr(dl_cfg, "sleep_min_s", 3),
+        "max_sleep_interval": getattr(dl_cfg, "sleep_max_s", 8),
         # NOTE: we deliberately do NOT use yt-dlp's download_archive. It marks a
         # video "done" BEFORE post-processing, so a failed ffmpeg convert poisons
         # the archive and the video is silently skipped forever. Our own Checkpoint
@@ -100,9 +222,19 @@ def _ydl_opts(out_dir: Path, dl_cfg) -> dict:
         "postprocessor_args": {"ffmpegextractaudio": postargs},
         "prefer_ffmpeg": True,
     }
-    if dl_cfg.cookies_file:
-        opts["cookiefile"] = dl_cfg.cookies_file
-    return opts
+
+
+def _bot_help(cookies: Path | None) -> None:
+    err("YouTube is blocking this machine (\"Sign in to confirm you're not a bot\").")
+    if cookies:
+        note("your cookies were rejected — they are expired/rotated or the account is flagged.")
+        note("re-export them from a FRESH private/incognito window (README → YouTube cookies),")
+        note("close that window right after exporting, upload the new cookies.txt, re-run.")
+    else:
+        note("export cookies.txt from a logged-in browser, upload it to the repo root,")
+        note('set download.cookies_file: "cookies.txt" in config.yaml, and re-run.')
+    note('also make sure yt-dlp is current:  pip install -U "yt-dlp[default]"')
+    note("finished videos are checkpointed — re-running only fetches what's missing.")
 
 
 def run(cfg) -> None:
@@ -111,7 +243,6 @@ def run(cfg) -> None:
            f"format={dl.audio_format}  sr={dl.sample_rate}Hz  ch={dl.channels}")
 
     # ffmpeg/ffprobe are required for audio extraction + conversion.
-    import shutil
     if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
         err("ffmpeg/ffprobe not found on PATH.")
         note("install it:  conda install -c conda-forge ffmpeg -y")
@@ -127,19 +258,25 @@ def run(cfg) -> None:
         err(f"sources file not found: {sources}")
         return
 
+    _preflight()
+    cookies = _cookie_file(dl)
+
     urls = _read_sources(sources)
     info(f"{len(urls)} source line(s) in {sources.name}")
 
     with console.status("[info]expanding channels / playlists …[/info]", spinner="dots"):
-        videos = _expand(urls, dl)
+        videos = _expand(urls, dl, cookies)
     ok(f"{len(videos)} unique video(s) to consider")
 
     ckpt = Checkpoint(state_dir, "download")
     import yt_dlp
-    opts = _ydl_opts(out_dir, dl)
+    opts = _ydl_opts(out_dir, dl, cookies)
+    # stop after this many back-to-back bot blocks instead of failing every video
+    abort_after = getattr(dl, "bot_abort_after", 5)
 
     done = skipped = failed = 0
-    last_err = ""
+    bot_streak = 0
+    aborted = False
     with progress() as bar:
         task = bar.add_task("[accent]downloading[/accent]", total=len(videos))
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -149,27 +286,31 @@ def run(cfg) -> None:
                     skipped += 1
                     bar.advance(task)
                     continue
-                bar.update(task, description=f"[accent]⬇[/accent] {v['title'][:50]}")
+                bar.update(task, description=f"[accent]⬇[/accent] {escape(v['title'][:50])}")
                 try:
                     ydl.download([v["url"]])
                     if target.exists():
                         ckpt.mark(v["id"])
                         done += 1
+                        bot_streak = 0
                     else:
                         failed += 1
                 except Exception as e:
                     failed += 1
-                    last_err = str(e)
-                    warn(f"failed {v['id']}: {e}")
+                    msg = _clean(e)
+                    warn(f"failed {v['id']}: {msg}")
+                    if _is_bot_block(msg):
+                        bot_streak += 1
+                        if abort_after and bot_streak >= abort_after:
+                            aborted = True
+                            break
+                    else:
+                        bot_streak = 0
                 bar.advance(task)
 
     ok(f"downloaded {done} • skipped {skipped} • failed {failed}")
     info(f"audios in [accent]{out_dir}[/accent]")
-
-    # Cloud/datacenter IPs (k8s pods) frequently hit YouTube bot-detection.
-    if failed and done == 0 and any(
-        s in last_err.lower() for s in ("sign in", "bot", "confirm", "cookies", "403")
-    ):
-        warn("YouTube is blocking this IP (bot check). This is common on cloud pods.")
-        note("Fix: export cookies from a logged-in browser to cookies.txt, then set")
-        note("download.cookies_file: \"cookies.txt\" in config.yaml and re-run.")
+    if aborted:
+        _bot_help(cookies)
+        # stop the full pipeline too: later stages would run on a partial download
+        raise SystemExit(1)

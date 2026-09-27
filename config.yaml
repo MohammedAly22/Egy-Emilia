@@ -24,7 +24,18 @@ download:
   concurrent_downloads: 3            # parallel video downloads
   retries: 10
   ignore_errors: true                # skip a video that fails, keep going
-  cookies_file: null                 # path to cookies.txt for age/region-gated content, or null
+  # YouTube blocks cloud IPs (RunPod) with "Sign in to confirm you're not a bot".
+  # Export cookies.txt from a logged-in browser and put it in the repo root
+  # (README -> "YouTube cookies"). It is git-ignored; never commit it.
+  cookies_file: "cookies.txt"
+  # pacing — random pause between videos + between metadata requests, so the
+  # cookie'd account isn't flagged for bot-like bursts
+  sleep_min_s: 3
+  sleep_max_s: 8
+  sleep_requests_s: 1
+  bot_abort_after: 5                 # stop after N back-to-back bot blocks (0 = never)
+  proxy: null                        # e.g. "http://user:pass@host:port" (residential proxy), or null
+  extractor_args: null               # advanced yt-dlp override, e.g. {youtube: {player_client: "tv,web"}}
 
 # ----------------------------------------------------------------------------
 # 2) DIARIZE + CHUNK  (run on every input audio)
@@ -37,7 +48,7 @@ diarization:
   target_chunk_s: 22.0               # splitter aims here; raise toward max for longer
   max_chunk_s: 30.0
   # longer-chunk levers
-  bridge_gap_s: 0.6                  # absorb tiny same-speaker interruptions
+  bridge_gap_s: 0.5                  # absorb tiny same-speaker interruptions
   bridge_overlap_s: 0.0
   # MERGE adjacent same-speaker regions separated only by silence (no other
   # speaker / no overlap) up to this gap. THE main lever for long chunks on
@@ -46,17 +57,17 @@ diarization:
   # no clipped word ends
   speech_pad_ms: 250
   tail_pad_s: 0.15
-  min_silence_ms: 700
+  min_silence_ms: 600
   # VAD / diarization sensitivity
-  vad_threshold: 0.5
-  diar_threshold: 0.5
+  vad_threshold: 0.3
+  diar_threshold: 0.3
   boundary_margin_s: 0.20
   # purity gate (TitaNet) — diarization ALREADY ensures single-speaker, so this is
   # just a light safety net. It now compares each 3s window to the chunk centroid
   # and rejects only clear outliers (a real 2nd voice ~0.5-0.7; same speaker ~0.85+).
   # Keep threshold LOW so normal phonetic variation isn't rejected.
   embedding_check: true
-  embedding_threshold: 0.40
+  embedding_threshold: 0.30
   # output audio
   write_sr: 24000                    # chunks are written at this SR
   write_format: "mp3"                # mp3 or wav
@@ -87,7 +98,7 @@ quality:
   # filtering — gate on ONE decisive metric (not the blended "overall", which can
   # let noisy/laughter/multi-voice chunks through). Default: DNSMOS overall.
   filter_metric: "dnsmos_ovrl"       # dnsmos_ovrl | utmos | overall
-  filter_threshold: 2.8              # keep chunks with filter_metric >= this
+  filter_threshold: 2.9              # keep chunks with filter_metric >= this
 
 # ----------------------------------------------------------------------------
 # 5) TRANSCRIPTION  (clean chunks only)
@@ -105,6 +116,17 @@ asr:
   batch_size: 8
   # code-switching: keep Latin-script English terms as-is in the output
   preserve_english: true
+
+# ----------------------------------------------------------------------------
+# 6) PUBLISH to HuggingFace Hub  (clean + transcribed chunks, audiofolder layout)
+#    Auth: `hf auth login` once, or export HF_TOKEN (needs WRITE access).
+# ----------------------------------------------------------------------------
+publish:
+  enabled: true
+  repo_id: "mohammedaly22/Egy-Emilia"  # <hf-user-or-org>/<dataset-name>
+  private: true                      # private = only you can see it
+  require_text: true                 # skip chunks without a transcription
+  staging_dir: "hf_dataset"          # local audiofolder layout (hardlinks, no extra disk)
 
 # ----------------------------------------------------------------------------
 # Runtime

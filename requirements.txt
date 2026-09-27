@@ -20,7 +20,12 @@ rich>=13.7            # colored console, spinners, progress bars
 tqdm>=4.66            # used inside diarize_chunk.py
 
 # --- download ---
-yt-dlp>=2024.0        # YouTube channels / playlists / videos (needs ffmpeg on PATH)
+yt-dlp[default]>=2025.11.12   # YouTube channels / playlists / videos (needs ffmpeg + deno on PATH)
+                              # keep it CURRENT: pip install -U "yt-dlp[default]"
+
+# --- publish ---
+huggingface_hub>=0.26 # private dataset upload (upload_large_folder)
+hf_xet               # fast large-file transfer to the Hub
 
 # --- quality scoring (all OPTIONAL; pipeline degrades gracefully if missing) ---
 # UTMOS pulls from torch.hub at runtime (no pin needed)

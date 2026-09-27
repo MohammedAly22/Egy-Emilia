@@ -1,4 +1,5 @@
-"""Full pipeline orchestrator: download -> diarize -> loudness -> quality -> transcribe.
+"""Full pipeline orchestrator:
+download -> diarize -> loudness -> quality -> transcribe -> publish.
 
 Each stage is independently resumable, so running the whole thing again only does
 the work that's left.
@@ -6,7 +7,7 @@ the work that's left.
 
 import time
 
-from . import diarize_stage, download, loudness, quality, transcribe
+from . import diarize_stage, download, loudness, publish, quality, transcribe
 from .config import load_config
 from .ui import banner, console, ok
 
@@ -17,6 +18,7 @@ STAGES = [
     ("loudness", loudness.run),
     ("quality", quality.run),
     ("transcribe", transcribe.run),
+    ("publish", publish.run),
 ]
 
 
