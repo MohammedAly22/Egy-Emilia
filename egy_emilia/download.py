@@ -6,13 +6,17 @@ channels into input_audios/. Resumable: our own checkpoint means re-running
 only fetches what's missing.
 
 Cloud IPs (RunPod, k8s, …) are routinely hit by YouTube's "Sign in to confirm
-you're not a bot" check. The fix is a cookies.txt exported from a logged-in
-browser (see README → "YouTube cookies"). This stage validates that file, paces
-its requests, and stops early with instructions if YouTube keeps blocking it.
+you're not a bot" check. Without cookies, the answer is a PO-token provider
+(bgutil, installed by scripts/setup_pot_provider.sh): this stage starts its
+server automatically. It also paces requests and stops early with instructions
+if YouTube keeps blocking the IP (README → "YouTube on RunPod").
 """
 
 import re
 import shutil
+import socket
+import subprocess
+import time
 from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -22,6 +26,8 @@ from rich.markup import escape
 from .config import resolve
 from .state import Checkpoint
 from .ui import banner, console, err, info, note, ok, progress, warn
+
+POT_PORT = 4416                     # bgutil server default; the plugin looks here
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -71,7 +77,6 @@ def _video_id(url: str) -> str | None:
 def _cookie_file(dl_cfg) -> Path | None:
     """Resolve + sanity-check download.cookies_file. Returns None if unusable."""
     if not getattr(dl_cfg, "cookies_file", None):
-        warn("no cookies_file set — YouTube will likely block a cloud IP (bot check).")
         return None
     p = resolve(dl_cfg.cookies_file)
     if not p.exists():
@@ -89,6 +94,48 @@ def _cookie_file(dl_cfg) -> Path | None:
         return None
     ok(f"using cookies: [accent]{p}[/accent]")
     return p
+
+
+def _port_open(port: int) -> bool:
+    with socket.socket() as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _start_pot_server(dl_cfg):
+    """Start the bgutil PO-token server if it isn't running. Returns the process
+    we started (so run() can stop it), or None."""
+    if not getattr(dl_cfg, "pot_provider", True):
+        return None
+    if _port_open(POT_PORT):
+        ok(f"PO-token server already running on :{POT_PORT}")
+        return None
+    try:
+        import yt_dlp_plugins.extractor.getpot_bgutil  # noqa: F401
+    except ImportError:
+        warn("PO-token plugin not installed — YouTube will likely block this cloud IP.")
+        note("run once:  bash scripts/setup_pot_provider.sh")
+        return None
+    main_js = resolve(getattr(dl_cfg, "pot_server_home",
+                              ".tools/bgutil-ytdlp-pot-provider/server")) / "build" / "main.js"
+    if not (main_js.exists() and shutil.which("node")):
+        warn(f"PO-token server not built ({main_js}) or node missing.")
+        note("run once:  bash scripts/setup_pot_provider.sh")
+        return None
+    log_path = resolve(getattr(dl_cfg, "pot_log", ".tools/pot_server.log"))
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log = open(log_path, "ab")
+    proc = subprocess.Popen(["node", str(main_js)], stdout=log, stderr=subprocess.STDOUT)
+    for _ in range(60):                     # wait up to ~30 s for it to listen
+        if _port_open(POT_PORT):
+            ok(f"PO-token server started on :{POT_PORT}")
+            return proc
+        if proc.poll() is not None:
+            break
+        time.sleep(0.5)
+    warn("PO-token server failed to start — see .tools/pot_server.log")
+    proc.terminate()
+    return None
 
 
 def _preflight() -> None:
@@ -114,6 +161,7 @@ def _base_opts(dl_cfg, cookies: Path | None) -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
+        "noprogress": True,              # our rich bar is the progress display
         # pace metadata requests; bursts are what trip the bot check
         "sleep_interval_requests": getattr(dl_cfg, "sleep_requests_s", 1),
     }
@@ -201,9 +249,9 @@ def _ydl_opts(out_dir: Path, dl_cfg, cookies: Path | None) -> dict:
     return {
         **_base_opts(dl_cfg, cookies),
         "format": "bestaudio/best",
-        # name strictly by video id; trim_file_name guards against any long fallback
+        # name strictly by video id. (No trim_file_name: yt-dlp applies it to the
+        # WHOLE path, so a long out_dir got truncated and files vanished.)
         "outtmpl": str(out_dir / "%(id)s.%(ext)s"),
-        "trim_file_name": 100,
         "restrictfilenames": True,
         "windowsfilenames": True,             # also forbids '?' etc. in names
         # We handle per-video errors ourselves (try/except below) so the actual
@@ -219,21 +267,25 @@ def _ydl_opts(out_dir: Path, dl_cfg, cookies: Path | None) -> dict:
         # the archive and the video is silently skipped forever. Our own Checkpoint
         # (below) only records a video once the final .mp3 actually exists on disk.
         "postprocessors": pp,
-        "postprocessor_args": {"ffmpegextractaudio": postargs},
+        # key is the PP name without "FFmpeg" — "ffmpegextractaudio" was silently
+        # ignored, so audio kept the source SR / channels
+        "postprocessor_args": {"extractaudio": postargs},
         "prefer_ffmpeg": True,
     }
 
 
-def _bot_help(cookies: Path | None) -> None:
+def _bot_help(cookies: Path | None, pot_running: bool) -> None:
     err("YouTube is blocking this machine (\"Sign in to confirm you're not a bot\").")
-    if cookies:
-        note("your cookies were rejected — they are expired/rotated or the account is flagged.")
-        note("re-export them from a FRESH private/incognito window (README → YouTube cookies),")
-        note("close that window right after exporting, upload the new cookies.txt, re-run.")
+    if not pot_running:
+        note("the PO-token provider is not running — set it up first:")
+        note("  bash scripts/setup_pot_provider.sh   then re-run")
+    elif cookies:
+        note("your cookies were rejected — re-export them (README → YouTube on RunPod).")
     else:
-        note("export cookies.txt from a logged-in browser, upload it to the repo root,")
-        note('set download.cookies_file: "cookies.txt" in config.yaml, and re-run.')
-    note('also make sure yt-dlp is current:  pip install -U "yt-dlp[default]"')
+        note("this pod's IP is flagged even with PO tokens. Options (README → YouTube on RunPod):")
+        note("  1. download on your home PC and send input_audios/ to the pod (runpodctl)")
+        note("  2. set download.proxy to a residential proxy")
+        note("  3. restart on a different pod / region (new IP) and re-run")
     note("finished videos are checkpointed — re-running only fetches what's missing.")
 
 
@@ -260,6 +312,21 @@ def run(cfg) -> None:
 
     _preflight()
     cookies = _cookie_file(dl)
+    pot_proc = _start_pot_server(dl)
+    pot_running = _port_open(POT_PORT)
+    try:
+        _download_all(cfg, sources, out_dir, state_dir, cookies, pot_running)
+    finally:
+        if pot_proc:
+            pot_proc.terminate()
+            try:
+                pot_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pot_proc.kill()
+
+
+def _download_all(cfg, sources, out_dir, state_dir, cookies, pot_running) -> None:
+    dl = cfg.download
 
     urls = _read_sources(sources)
     info(f"{len(urls)} source line(s) in {sources.name}")
@@ -295,6 +362,7 @@ def run(cfg) -> None:
                         bot_streak = 0
                     else:
                         failed += 1
+                        warn(f"failed {v['id']}: finished but {target.name} was not created")
                 except Exception as e:
                     failed += 1
                     msg = _clean(e)
@@ -311,6 +379,6 @@ def run(cfg) -> None:
     ok(f"downloaded {done} • skipped {skipped} • failed {failed}")
     info(f"audios in [accent]{out_dir}[/accent]")
     if aborted:
-        _bot_help(cookies)
+        _bot_help(cookies, pot_running)
         # stop the full pipeline too: later stages would run on a partial download
         raise SystemExit(1)

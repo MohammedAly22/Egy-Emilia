@@ -89,41 +89,56 @@ conda install -c conda-forge ffmpeg -y   # or: apt-get install -y ffmpeg
 # 6) deno — yt-dlp needs a JS runtime to solve YouTube's player challenges
 conda install -c conda-forge deno -y
 
+# 6b) PO-token provider — lets YouTube downloads work on a cloud IP, no cookies
+bash scripts/setup_pot_provider.sh
+
 # 7) HuggingFace login (for the publish stage; token needs WRITE access)
 hf auth login                            # or: export HF_TOKEN=hf_xxx
 ```
 
 ---
 
-## 🍪 YouTube cookies (required on RunPod / any cloud GPU)
+## 🛡️ YouTube on RunPod (no cookies needed)
 
-YouTube blocks datacenter IPs with **"Sign in to confirm you're not a bot"**. The fix is
-to send the cookies of a logged-in YouTube session with every request.
+YouTube blocks datacenter IPs with **"Sign in to confirm you're not a bot"**. EGY-Emilia
+handles this **without cookies** using a PO-token provider
+([bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)),
+which makes yt-dlp's requests look like a real browser. Install it once:
 
-> 🔐 Use a **secondary / throwaway Google account**. Heavy downloading with cookies can
-> get the account rate-limited. `cookies.txt` is in `.gitignore` — **never commit it**.
+```bash
+bash scripts/setup_pot_provider.sh     # Node 22 + plugin + token server into .tools/
+```
 
-1. On your **local PC**, open a **private / incognito** window and log in to YouTube.
-2. In that same window go to `https://www.youtube.com/robots.txt` (keep it the only tab).
-3. Export cookies for youtube.com in **Netscape format**, either with the
-   *Get cookies.txt LOCALLY* browser extension (allow it in incognito), or with
-   `yt-dlp --cookies-from-browser chrome --cookies cookies.txt --skip-download "https://www.youtube.com/watch?v=4axSKMfXHlE"`.
-4. **Close the private window right away**, otherwise YouTube rotates the cookies and
-   the exported ones stop working.
-5. Upload `cookies.txt` to the repo root on the pod (Jupyter upload, or
-   `scp -P <port> cookies.txt root@<pod-ip>:/workspace/Egy-Emilia/`).
-
-`config.yaml → download.cookies_file: "cookies.txt"` is already set. The download
-stage validates the file, paces requests (`sleep_min_s` / `sleep_max_s`), and after
-`bot_abort_after` consecutive bot blocks it **stops with instructions** instead of
-failing all remaining videos. When that happens, re-export the cookies (steps 1–5) and re-run:
-finished videos are checkpointed.
+That's it. `python download.py` / `run_pipeline.py` **start and stop the token server
+automatically** (`✓ PO-token server started on :4416`). The stage also paces requests
+(`sleep_min_s` / `sleep_max_s`) and, after `bot_abort_after` consecutive bot blocks,
+**stops with instructions** instead of failing every remaining video. Finished videos
+are checkpointed, so re-running only fetches what's missing.
 
 Single-video links (`youtu.be/…`, `watch?v=…`) are parsed locally, so expanding them
 makes no request to YouTube.
 
-> ℹ️ First run downloads model checkpoints from HuggingFace → the pod needs network access
-> (or pre-cache and set `HF_HOME`).
+### If the pod's IP is still blocked
+
+PO tokens help a lot, but YouTube can still hard-block a particular datacenter IP. Fallbacks,
+none of which use cookies:
+
+1. **Download at home, process on the pod** (always works: home IPs aren't blocked).
+   On your PC (Python + ffmpeg + deno installed):
+   ```bash
+   git clone https://github.com/MohammedAly22/Egy-Emilia && cd Egy-Emilia
+   pip install -U "yt-dlp[default]" rich pyyaml
+   python download.py                     # → input_audios/*.mp3
+   runpodctl send input_audios            # prints a one-time code
+   ```
+   On the pod, in the repo root: `runpodctl receive <code>`, then `python run_pipeline.py`.
+   Already-present audios are skipped, so the download stage just fetches anything missing.
+   (`runpodctl` is preinstalled on pods; for Windows get it from
+   https://github.com/runpod/runpodctl/releases.)
+2. **New IP:** stop the pod and start one in another region, then re-run.
+3. **Residential proxy:** set `download.proxy: "http://user:pass@host:port"` in `config.yaml`.
+
+`download.cookies_file` still exists as an optional last resort, but it is `null` by default.
 
 ---
 

@@ -25,11 +25,14 @@ download:
   retries: 10
   ignore_errors: true                # skip a video that fails, keep going
   # YouTube blocks cloud IPs (RunPod) with "Sign in to confirm you're not a bot".
-  # Export cookies.txt from a logged-in browser and put it in the repo root
-  # (README -> "YouTube cookies"). It is git-ignored; never commit it.
-  cookies_file: "cookies.txt"
+  # Cookie-free fix: a PO-token provider. Install once with
+  #   bash scripts/setup_pot_provider.sh
+  # and the download stage starts/stops its server by itself.
+  pot_provider: true
+  pot_server_home: ".tools/bgutil-ytdlp-pot-provider/server"
+  cookies_file: null                 # optional: path to a cookies.txt (not needed)
   # pacing — random pause between videos + between metadata requests, so the
-  # cookie'd account isn't flagged for bot-like bursts
+  # IP isn't flagged for bot-like bursts
   sleep_min_s: 3
   sleep_max_s: 8
   sleep_requests_s: 1
