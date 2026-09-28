@@ -33,10 +33,14 @@ download:
   cookies_file: null                 # optional: path to a cookies.txt (not needed)
   # pacing — random pause between videos + between metadata requests, so the
   # IP isn't flagged for bot-like bursts
-  sleep_min_s: 3
-  sleep_max_s: 8
+  sleep_min_s: 10
+  sleep_max_s: 30
   sleep_requests_s: 1
-  bot_abort_after: 5                 # stop after N back-to-back bot blocks (0 = never)
+  # rate limits: after N back-to-back bot blocks, PAUSE (cooldown) then retry the
+  # blocked videos. Cooldowns grow while blocks persist and reset after a success;
+  # the stage gives up only if every cooldown in a row fails.
+  bot_abort_after: 5
+  cooldown_minutes: [10, 20, 40, 60, 60, 60]
   proxy: null                        # e.g. "http://user:pass@host:port" (residential proxy), or null
   extractor_args: null               # advanced yt-dlp override, e.g. {youtube: {player_client: "tv,web"}}
 

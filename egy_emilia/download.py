@@ -20,6 +20,7 @@ import shutil
 import socket
 import subprocess
 import time
+from collections import deque
 from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -299,7 +300,7 @@ def _bot_help(cookies: Path | None, pot_running: bool) -> None:
     if cookies:
         note("your cookies were rejected — re-export them (README → YouTube on RunPod).")
     else:
-        note("this pod's IP is flagged even with PO tokens. Options (README → YouTube on RunPod):")
+        note("the block did not lift after every cooldown. Options (README → YouTube on RunPod):")
         note("  0. python scripts/diagnose_youtube.py  (finds a player client that still works)")
         note("     and keep download.js_runtime / pot_provider = false (plain yt-dlp)")
         note("  1. download on your home PC and send input_audios/ to the pod (runpodctl)")
@@ -363,47 +364,88 @@ def _download_all(cfg, sources, out_dir, state_dir, cookies, pot_running) -> Non
     ckpt = Checkpoint(state_dir, "download")
     import yt_dlp
     opts = _ydl_opts(out_dir, dl, cookies)
-    # stop after this many back-to-back bot blocks instead of failing every video
-    abort_after = getattr(dl, "bot_abort_after", 5)
+    # YouTube rate-limits an IP after a burst of downloads, then lifts the block
+    # after a while. After `bot_abort_after` back-to-back blocks we PAUSE for the
+    # next cooldown, retry the blocked videos with a fresh session, and go on.
+    # Cooldowns grow while blocks persist and reset after any success; we only
+    # give up when every cooldown in a row fails.
+    abort_after = max(1, getattr(dl, "bot_abort_after", 5))
+    cooldowns = list(getattr(dl, "cooldown_minutes", None) or [10, 20, 40, 60, 60, 60])
 
-    done = skipped = failed = 0
-    bot_streak = 0
+    queue = deque()
+    skipped = 0
+    for v in videos:
+        if ckpt.done(v["id"]) or (out_dir / f"{v['id']}.{dl.audio_format}").exists():
+            skipped += 1
+        else:
+            queue.append(v)
+
+    done = failed = 0
+    bot_streak = level = 0
+    blocked: list[dict] = []           # bot-blocked in the current streak -> retried
     aborted = False
     with progress() as bar:
-        task = bar.add_task("[accent]downloading[/accent]", total=len(videos))
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            for v in videos:
+        task = bar.add_task("[accent]downloading[/accent]", total=len(videos), completed=skipped)
+        ydl = yt_dlp.YoutubeDL(opts)
+        try:
+            while queue:
+                v = queue.popleft()
                 target = out_dir / f"{v['id']}.{dl.audio_format}"
-                if ckpt.done(v["id"]) or target.exists():
-                    skipped += 1
-                    bar.advance(task)
-                    continue
                 bar.update(task, description=f"[accent]⬇[/accent] {escape(v['title'][:50])}")
                 try:
                     ydl.download([v["url"]])
                     if target.exists():
                         ckpt.mark(v["id"])
                         done += 1
-                        bot_streak = 0
+                        bot_streak = level = 0
+                        # videos blocked earlier in this streak get another go
+                        queue.extendleft(reversed(blocked))
+                        blocked.clear()
                     else:
                         failed += 1
                         warn(f"failed {v['id']}: finished but {target.name} was not created")
+                    bar.advance(task)
                 except Exception as e:
-                    failed += 1
                     msg = _clean(e)
-                    warn(f"failed {v['id']}: {msg}")
-                    if _is_bot_block(msg):
-                        bot_streak += 1
-                        if abort_after and bot_streak >= abort_after:
-                            aborted = True
-                            break
-                    else:
-                        bot_streak = 0
-                bar.advance(task)
+                    if not _is_bot_block(msg):
+                        failed += 1                  # private / removed / etc.: skip it
+                        warn(f"failed {v['id']}: {msg.splitlines()[0][:160]}")
+                        bar.advance(task)
+                        continue
+                    bot_streak += 1
+                    blocked.append(v)
+                    warn(f"blocked {v['id']} ({bot_streak}/{abort_after}) — will retry")
+                    if bot_streak < abort_after:
+                        continue
+                    if level >= len(cooldowns):
+                        aborted = True
+                        break
+                    _cooldown(bar, task, cooldowns[level], done, len(videos) - skipped)
+                    level += 1
+                    bot_streak = 0
+                    queue.extendleft(reversed(blocked))
+                    blocked.clear()
+                    ydl.close()
+                    ydl = yt_dlp.YoutubeDL(opts)     # fresh session after the pause
+        finally:
+            ydl.close()
 
-    ok(f"downloaded {done} • skipped {skipped} • failed {failed}")
+    failed += len(blocked) + (len(queue) if aborted else 0)
+    ok(f"downloaded {done} • already had {skipped} • failed {failed}")
     info(f"audios in [accent]{out_dir}[/accent]")
     if aborted:
         _bot_help(cookies, pot_running)
         # stop the full pipeline too: later stages would run on a partial download
         raise SystemExit(1)
+
+
+def _cooldown(bar, task, minutes: float, done: int, todo: int) -> None:
+    """Pause with a live countdown in the progress bar while YouTube's block lifts."""
+    warn(f"YouTube is rate-limiting this IP — pausing {minutes:g} min, then retrying "
+         f"({done}/{todo} downloaded this run)")
+    end = time.time() + minutes * 60
+    while (left := end - time.time()) > 0:
+        m, s = divmod(int(left), 60)
+        bar.update(task, description=f"[warn]⏸ rate-limited, retrying in {m:02d}:{s:02d}[/warn]")
+        time.sleep(1)
+    info("resuming downloads")

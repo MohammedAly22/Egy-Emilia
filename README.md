@@ -115,9 +115,12 @@ download:
 ```
 
 The download stage enforces this even when deno or the plugin is installed in the env. It also
-paces requests (`sleep_min_s` / `sleep_max_s`) and, after `bot_abort_after` consecutive bot
-blocks, **stops with instructions** instead of failing every remaining video. Finished videos are
-checkpointed. Single-video links are parsed locally, with no request to YouTube.
+paces requests (`sleep_min_s` / `sleep_max_s`, 10–30 s). YouTube still rate-limits an IP after a
+burst of downloads, so after `bot_abort_after` consecutive blocks the stage **pauses**
+(`cooldown_minutes`: 10 → 20 → 40 → 60 min, reset after every success), then retries the blocked
+videos with a fresh session. It only gives up if the block outlasts every cooldown. Finished videos
+are checkpointed. For long runs, prefer a terminal that survives disconnects:
+`nohup python download.py > download.log 2>&1 &` (watch with `tail -f download.log`). Single-video links are parsed locally, with no request to YouTube.
 
 ### If the pod's IP is still blocked
 
