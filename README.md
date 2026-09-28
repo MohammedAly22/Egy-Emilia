@@ -163,7 +163,7 @@ quality:
   filter_threshold: 2.8    # ✅ chunks with overall >= this → chunks_clean.json
 
 asr:
-  backend: "egyptalk"      # 🗣️ "egyptalk" (NeMo) | "seamless" (Meta M4T v2)
+  backend: "qwencleo"      # 🗣️ "qwencleo" | "cohere" | "whisper" | "egyptalk" | "seamless"
   preserve_english: true   # 🔤 keep code-switched English terms in Latin script
 
 publish:
@@ -294,6 +294,8 @@ variants underperform on it. EGY-Emilia keeps ASR **pluggable** via `asr.backend
 - **`whisper`** — Whisper large-v3 family; keeps code-switched English in Latin script.
 - **`egyptalk`** — `NAMAA-Space/EgypTalk-ASR-v2`, NeMo FastConformer (Arabic script only).
 - **`seamless`** — `facebook/seamless-m4t-v2-large`, Egyptian Arabic (`arz`).
+- **`cohere`** — [`CohereLabs/cohere-transcribe-arabic-07-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-arabic-07-2026),
+  2B params, Arabic + dialects + Arabic/English code-switching, with punctuation. Runs in its own env (see below).
 
 Switch via `asr.backend` in the config — no code changes.
 
@@ -303,9 +305,27 @@ Switch via `asr.backend` in the config — no code changes.
 # torch is already installed (Setup step 2). Then:
 pip install qwencleo-asr --no-deps
 pip install "qwen-asr>=0.0.6"
+pip install "transformers==4.57.6"
 ```
 `--no-deps` keeps qwencleo-asr from re-resolving torch/transformers against our pinned
 stack. First run downloads `mohammedaly22/QwenCleo-ASR` from HuggingFace.
+
+> ⚠️ **transformers must be ≥ 4.57.3** (use `4.57.6`, which qwen-asr pins and NeMo accepts).
+> NeMo may install an older 4.57.x, which makes every batch fail with
+> `check_model_inputs() missing 1 required positional argument: 'func'`.
+
+### Installing Cohere Transcribe Arabic
+
+It needs **transformers ≥ 5.4**, which can't coexist with NeMo/QwenCleo's 4.57.x. So it gets
+its own small venv that **reuses the egy env's torch** (no second torch download). The pipeline
+talks to it through a worker process (`egy_emilia/asr_cohere_worker.py`):
+
+```bash
+conda activate egy
+bash scripts/setup_cohere_env.sh      # creates .venvs/cohere + downloads the model (~4 GB)
+```
+Then set `asr.backend: "cohere"` in `config.yaml`. Options: `cohere_language` (`ar`/`en`),
+`cohere_punctuation`. The worker's log is in `.state/cohere_worker.log`.
 
 > ⚠️ Model availability shifts; if a checkpoint 404s, swap it in `config.yaml`
 > (`asr.egyptalk_model` / `asr.seamless_model` / `asr.whisper_model`).

@@ -111,11 +111,17 @@ asr:
   # "whisper"  -> Whisper large-v3 family, English kept in Latin script
   # "egyptalk" -> NeMo FastConformer, best pure-Egyptian but Arabic-script only
   # "seamless" -> Meta M4T v2 (arz)
+  # "cohere"   -> Cohere Transcribe Arabic (Arabic + dialects + code-switching);
+  #               runs in its own env: bash scripts/setup_cohere_env.sh
   backend: "qwencleo"
   qwencleo_language: "Arabic"        # "Arabic" anchors dialect; null/"auto" = auto-detect
   whisper_model: "openai/whisper-large-v3"
   egyptalk_model: "NAMAA-Space/EgypTalk-ASR-v2"
   seamless_model: "facebook/seamless-m4t-v2-large"
+  cohere_model: "CohereLabs/cohere-transcribe-arabic-07-2026"
+  cohere_language: "ar"              # "ar" (Arabic + code-switching) or "en"
+  cohere_punctuation: true
+  cohere_python: ".venvs/cohere/bin/python"   # env with transformers>=5.4 (null = current env)
   batch_size: 8
   # code-switching: keep Latin-script English terms as-is in the output
   preserve_english: true

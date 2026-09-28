@@ -6,15 +6,21 @@ ASR backend is pluggable (config.asr.backend):
   • "whisper"   — Whisper large-v3 family; keeps code-switched English in Latin script.
   • "egyptalk"  — NAMAA-Space/EgypTalk-ASR-v2, NeMo FastConformer (Arabic script only).
   • "seamless"  — facebook/seamless-m4t-v2-large, Egyptian Arabic (arz).
+  • "cohere"    — CohereLabs/cohere-transcribe-arabic-07-2026 (Arabic + dialects +
+                  Arabic/English code-switching). Needs transformers>=5.4, so it runs
+                  in its own env (scripts/setup_cohere_env.sh) via asr_cohere_worker.py.
 
 Output: transcriptions are written back into chunks_clean.json (field "text"),
 and a transcripts.json is also written. Resumable per chunk.
 """
 
 import json
+import subprocess
+import sys
+from pathlib import Path
 
 from .config import resolve
-from .ui import banner, info, ok, progress, warn
+from .ui import banner, err, info, note, ok, progress, warn
 
 
 # --------------------------------------------------------------------------- #
@@ -24,6 +30,17 @@ class QwenCleoBackend:
     """QwenCleo-ASR (Qwen3-ASR-1.7B) — Egyptian Arabic + code-switching. Default."""
 
     def __init__(self, cfg):
+        # qwen-asr decorates its model with transformers' @check_model_inputs(),
+        # which only exists in that form from 4.57.3 (qwen-asr pins 4.57.6).
+        # Older 4.57.x fails every batch with "check_model_inputs() missing 1
+        # required positional argument: 'func'".
+        import transformers
+        from packaging.version import Version
+        if Version(transformers.__version__) < Version("4.57.3"):
+            raise RuntimeError(
+                f"transformers {transformers.__version__} is too old for QwenCleo-ASR; "
+                'run:  pip install "transformers==4.57.6"  (also fine for NeMo), '
+                "then restart the kernel / re-run")
         from qwencleo_asr import QwenCleoASR
         # Constructor loads mohammedaly22/QwenCleo-ASR by default.
         self.asr = QwenCleoASR()
@@ -141,6 +158,64 @@ class WhisperCSBackend:
         return [(o.get("text") or "").strip() for o in outs]
 
 
+class CohereBackend:
+    """Cohere Transcribe Arabic, run in a separate env through asr_cohere_worker.py.
+
+    cohere-transcribe needs transformers>=5.4 while NeMo / qwen-asr need 4.57.x,
+    so the model lives in its own interpreter (asr.cohere_python) and we talk to
+    it over stdin/stdout. If cohere_python is null, the current interpreter is
+    used (only works if this env already has transformers>=5.4).
+    """
+
+    def __init__(self, cfg):
+        a = cfg.asr
+        py = getattr(a, "cohere_python", None)
+        python = str(resolve(py)) if py else sys.executable
+        if py and not Path(python).exists():
+            raise RuntimeError(f"cohere env not found: {python} — "
+                               "create it once:  bash scripts/setup_cohere_env.sh")
+        worker = Path(__file__).with_name("asr_cohere_worker.py")
+        self.log_path = resolve(cfg.paths.state_dir) / "cohere_worker.log"
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._log = open(self.log_path, "ab")
+        device = "cuda" if cfg.runtime.device == "cuda" else "cpu"
+        self.proc = subprocess.Popen(
+            [python, str(worker), "--model", a.cohere_model,
+             "--language", getattr(a, "cohere_language", "ar"),
+             "--punctuation", "1" if getattr(a, "cohere_punctuation", True) else "0",
+             "--device", device],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._log,
+            text=True, encoding="utf-8", bufsize=1)
+        ready = self._read()                          # waits for the model to load
+        info(f"cohere worker ready on {ready.get('device')}")
+
+    def _read(self) -> dict:
+        line = self.proc.stdout.readline()
+        if not line:
+            self.proc.wait()
+            tail = self.log_path.read_text(errors="ignore").splitlines()[-15:]
+            raise RuntimeError("cohere worker died (exit %s). Last log lines:\n%s"
+                               % (self.proc.returncode, "\n".join(tail)))
+        msg = json.loads(line)
+        if "error" in msg:
+            raise RuntimeError(msg["error"] + f"  (details: {self.log_path})")
+        return msg
+
+    def transcribe(self, paths: list[str]) -> list[str]:
+        self.proc.stdin.write(json.dumps({"paths": paths}, ensure_ascii=False) + "\n")
+        self.proc.stdin.flush()
+        return self._read()["texts"]
+
+    def close(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.stdin.close()
+            try:
+                self.proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self._log.close()
+
+
 def _make_backend(cfg):
     b = cfg.asr.backend.lower()
     if b == "qwencleo":
@@ -151,6 +226,8 @@ def _make_backend(cfg):
         return EgypTalkBackend(cfg)
     if b == "seamless":
         return SeamlessBackend(cfg)
+    if b == "cohere":
+        return CohereBackend(cfg)
     raise ValueError(f"unknown asr.backend: {cfg.asr.backend!r}")
 
 
@@ -165,7 +242,7 @@ def run(cfg) -> None:
         warn("chunks_clean.json not found — run quality scoring first")
         return
 
-    records = json.loads(clean_path.read_text())
+    records = json.loads(clean_path.read_text(encoding="utf-8"))
     todo = [r for r in records if not r.get("text")]
     info(f"{len(records)} clean chunk(s); {len(todo)} need transcription")
     if not todo:
@@ -177,26 +254,52 @@ def run(cfg) -> None:
 
     bs = cfg.asr.batch_size
     by_path = {r["chunk_path"]: r for r in records}
-    with progress() as bar:
-        task = bar.add_task("[accent]transcribing[/accent]", total=len(todo))
-        for i in range(0, len(todo), bs):
-            batch = todo[i:i + bs]
-            paths = [str(out_root / r["chunk_path"]) for r in batch]
-            try:
-                texts = backend.transcribe(paths)
-            except Exception as e:
-                warn(f"batch failed: {e}")
-                texts = [""] * len(batch)
-            for r, t in zip(batch, texts):
-                by_path[r["chunk_path"]]["text"] = (t or "").strip()
-            # checkpoint after each batch so an interrupt loses at most one batch
-            clean_path.write_text(json.dumps(records, ensure_ascii=False, indent=2))
-            bar.advance(task, advance=len(batch))
+    done = failed = empty = 0
+    try:
+        with progress() as bar:
+            task = bar.add_task("[accent]transcribing[/accent]", total=len(todo))
+            for i in range(0, len(todo), bs):
+                batch = todo[i:i + bs]
+                paths = [str(out_root / r["chunk_path"]) for r in batch]
+                try:
+                    texts = backend.transcribe(paths)
+                    if len(texts) != len(batch):
+                        raise RuntimeError(f"backend returned {len(texts)} texts for {len(batch)} chunks")
+                except Exception as e:
+                    failed += len(batch)
+                    warn(f"batch failed: {e}")
+                    if not done:
+                        # the very first batch failed: a setup problem, not a bad
+                        # chunk; stop instead of failing every remaining batch
+                        err("stopping: fix the error above and re-run this stage "
+                            "(chunks are only marked done when transcribed)")
+                        break
+                    bar.advance(task, advance=len(batch))
+                    continue
+                for r, t in zip(batch, texts):
+                    t = (t or "").strip()
+                    if t:
+                        by_path[r["chunk_path"]]["text"] = t
+                        done += 1
+                    else:
+                        empty += 1
+                # checkpoint after each batch so an interrupt loses at most one batch
+                clean_path.write_text(json.dumps(records, ensure_ascii=False, indent=2),
+                                      encoding="utf-8")
+                bar.advance(task, advance=len(batch))
+    finally:
+        if hasattr(backend, "close"):
+            backend.close()
 
     (out_root / "transcripts.json").write_text(
         json.dumps([{"chunk_path": r["chunk_path"], "text": r.get("text", "")}
-                    for r in records], ensure_ascii=False, indent=2))
-    ok(f"transcribed {len(todo)} chunk(s) → chunks_clean.json + transcripts.json")
+                    for r in records], ensure_ascii=False, indent=2), encoding="utf-8")
+    msg = f"transcribed {done}/{len(todo)} chunk(s)"
+    if failed or empty:
+        warn(f"{msg} • {failed} failed • {empty} came back empty")
+        note("re-run this stage to retry them (finished chunks are skipped)")
+    else:
+        ok(f"{msg} → chunks_clean.json + transcripts.json")
 
 
 def console_status_loading():
