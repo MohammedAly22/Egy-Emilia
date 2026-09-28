@@ -6,11 +6,14 @@ channels into input_audios/. Resumable: our own checkpoint means re-running
 only fetches what's missing.
 
 Cloud IPs (RunPod, k8s, …) are routinely hit by YouTube's "Sign in to confirm
-you're not a bot" check. Without cookies, the answer is a PO-token provider
-(bgutil, installed by scripts/setup_pot_provider.sh): this stage starts its
-server automatically. It also paces requests and stops early with instructions
-if YouTube keeps blocking the IP (README → "YouTube on RunPod").
+you're not a bot" check. On RunPod, what gets through is PLAIN yt-dlp: no JS
+runtime (so only the `visionos` player client is used) and no plugins. That is
+the default here (download.js_runtime / download.pot_provider = false). The
+stage also paces requests and stops early with instructions if YouTube keeps
+blocking the IP (README → "YouTube on RunPod").
 """
+
+import os
 
 import re
 import shutil
@@ -114,7 +117,7 @@ def _port_open(port: int) -> bool:
 def _start_pot_server(dl_cfg):
     """Start the bgutil PO-token server if it isn't running. Returns the process
     we started (so run() can stop it), or None."""
-    if not getattr(dl_cfg, "pot_provider", True):
+    if not getattr(dl_cfg, "pot_provider", False):
         return None
     if _port_open(POT_PORT):
         ok(f"PO-token server already running on :{POT_PORT}")
@@ -151,11 +154,10 @@ def _start_pot_server(dl_cfg):
     return None
 
 
-def _preflight() -> None:
+def _preflight(dl_cfg) -> None:
     """Warn about the two other common causes of YouTube failures."""
-    # YouTube now needs a JS runtime to solve its player challenges; deno is
-    # what yt-dlp enables by default.
-    if not shutil.which("deno"):
+    # web clients need a JS runtime (deno) for YouTube's player challenges
+    if getattr(dl_cfg, "js_runtime", False) and not shutil.which("deno"):
         warn("deno not found on PATH — yt-dlp needs it to solve YouTube's JS challenges.")
         note("install it:  conda install -c conda-forge deno -y")
     # YouTube changes constantly; an old yt-dlp is the #1 cause of breakage.
@@ -179,6 +181,10 @@ def _base_opts(dl_cfg, cookies: Path | None) -> dict:
         # pace metadata requests; bursts are what trip the bot check
         "sleep_interval_requests": getattr(dl_cfg, "sleep_requests_s", 1),
     }
+    if not getattr(dl_cfg, "js_runtime", False):
+        # no JS runtime -> yt-dlp uses only the `visionos` client, which is
+        # what YouTube still serves to RunPod IPs (web clients get bot-checked)
+        opts["js_runtimes"] = {}
     if cookies:
         opts["cookiefile"] = str(cookies)
     if getattr(dl_cfg, "proxy", None):
@@ -290,14 +296,12 @@ def _ydl_opts(out_dir: Path, dl_cfg, cookies: Path | None) -> dict:
 
 def _bot_help(cookies: Path | None, pot_running: bool) -> None:
     err("YouTube is blocking this machine (\"Sign in to confirm you're not a bot\").")
-    if not pot_running:
-        note("the PO-token provider is not running — set it up first:")
-        note("  bash scripts/setup_pot_provider.sh   then re-run")
-    elif cookies:
+    if cookies:
         note("your cookies were rejected — re-export them (README → YouTube on RunPod).")
     else:
         note("this pod's IP is flagged even with PO tokens. Options (README → YouTube on RunPod):")
         note("  0. python scripts/diagnose_youtube.py  (finds a player client that still works)")
+        note("     and keep download.js_runtime / pot_provider = false (plain yt-dlp)")
         note("  1. download on your home PC and send input_audios/ to the pod (runpodctl)")
         note("  2. set download.proxy to a residential proxy")
         note("  3. restart on a different pod / region (new IP) and re-run")
@@ -325,7 +329,13 @@ def run(cfg) -> None:
         err(f"sources file not found: {sources}")
         return
 
-    _preflight()
+    # Plugins load on the first YoutubeDL() of the process; the bgutil plugin
+    # changes client behaviour, so keep plain yt-dlp unless it is asked for.
+    if getattr(dl, "pot_provider", False):
+        os.environ.pop("YTDLP_NO_PLUGINS", None)
+    else:
+        os.environ["YTDLP_NO_PLUGINS"] = "1"
+    _preflight(dl)
     cookies = _cookie_file(dl)
     pot_proc = _start_pot_server(dl)
     pot_running = _port_open(POT_PORT)

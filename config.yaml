@@ -24,11 +24,11 @@ download:
   concurrent_downloads: 3            # parallel video downloads
   retries: 10
   ignore_errors: true                # skip a video that fails, keep going
-  # YouTube blocks cloud IPs (RunPod) with "Sign in to confirm you're not a bot".
-  # Cookie-free fix: a PO-token provider. Install once with
-  #   bash scripts/setup_pot_provider.sh
-  # and the download stage starts/stops its server by itself.
-  pot_provider: true
+  # YouTube bot-checks cloud IPs (RunPod). What works there is PLAIN yt-dlp:
+  # no JS runtime (-> only the `visionos` client) and no plugins. Keep both false
+  # unless diagnose_youtube.py shows otherwise.
+  js_runtime: false                  # true = let yt-dlp use deno + web clients
+  pot_provider: false                # true = bgutil PO tokens (scripts/setup_pot_provider.sh)
   pot_server_home: ".tools/bgutil-ytdlp-pot-provider/server"
   cookies_file: null                 # optional: path to a cookies.txt (not needed)
   # pacing — random pause between videos + between metadata requests, so the

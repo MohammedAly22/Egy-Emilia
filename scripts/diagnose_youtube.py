@@ -8,6 +8,7 @@ config.yaml line to use for the first client that works.
   python scripts/diagnose_youtube.py [VIDEO_URL]
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -18,7 +19,7 @@ from yt_dlp.networking import Request  # noqa: E402
 
 from egy_emilia.config import load_config  # noqa: E402
 from egy_emilia.download import (  # noqa: E402
-    POT_PORT, _clean, _cookie_file, _port_open, _Silent, _start_pot_server)
+    POT_PORT, _base_opts, _clean, _cookie_file, _port_open, _start_pot_server)
 from egy_emilia.ui import console, err, info, ok, warn  # noqa: E402
 
 CLIENTS = ["default", "tv", "tv_simply", "web_embedded", "mweb", "web_safari",
@@ -26,11 +27,10 @@ CLIENTS = ["default", "tv", "tv_simply", "web_embedded", "mweb", "web_safari",
 URL = sys.argv[1] if len(sys.argv) > 1 else "https://www.youtube.com/watch?v=ng6k7oBbvog"
 
 
-def _try(client: str, cookies) -> tuple[bool, str]:
-    opts = {"quiet": True, "no_warnings": True, "logger": _Silent(),
-            "format": "bestaudio/best"}
-    if cookies:
-        opts["cookiefile"] = str(cookies)
+def _try(client: str, dl_cfg, cookies) -> tuple[bool, str]:
+    # same auth / JS-runtime / proxy settings as the real download stage
+    opts = {**_base_opts(dl_cfg, cookies), "format": "bestaudio/best"}
+    opts.pop("extractor_args", None)
     if client != "default":
         opts["extractor_args"] = {"youtube": {"player_client": [client]}}
     with yt_dlp.YoutubeDL(opts) as ydl:
@@ -54,16 +54,21 @@ def _try(client: str, cookies) -> tuple[bool, str]:
 
 def main() -> None:
     cfg = load_config()
-    cookies = _cookie_file(cfg.download)
-    proc = _start_pot_server(cfg.download)
-    if not _port_open(POT_PORT):
+    dl = cfg.download
+    if not getattr(dl, "pot_provider", False):
+        os.environ["YTDLP_NO_PLUGINS"] = "1"       # plain yt-dlp, like the pipeline
+    info(f"js_runtime={getattr(dl, 'js_runtime', False)}  "
+         f"pot_provider={getattr(dl, 'pot_provider', False)}  (from config.yaml)")
+    cookies = _cookie_file(dl)
+    proc = _start_pot_server(dl)
+    if getattr(dl, "pot_provider", False) and not _port_open(POT_PORT):
         warn("PO-token server not running — results reflect NO PO tokens")
     info(f"test video: {URL}")
     working = []
     try:
         for c in CLIENTS:
             with console.status(f"trying {c} …"):
-                good, why = _try(c, cookies)
+                good, why = _try(c, dl, cookies)
             (ok if good else err)(f"{c:<13} {why}")
             if good:
                 working.append(c)

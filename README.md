@@ -89,8 +89,9 @@ conda install -c conda-forge ffmpeg -y   # or: apt-get install -y ffmpeg
 # 6) deno — yt-dlp needs a JS runtime to solve YouTube's player challenges
 conda install -c conda-forge deno -y
 
-# 6b) PO-token provider — lets YouTube downloads work on a cloud IP, no cookies
-bash scripts/setup_pot_provider.sh
+# 6b) OPTIONAL PO-token provider (only if diagnose_youtube.py shows you need it;
+#     then set download.pot_provider: true)
+# bash scripts/setup_pot_provider.sh
 
 # 7) HuggingFace login (for the publish stage; token needs WRITE access)
 hf auth login                            # or: export HF_TOKEN=hf_xxx
@@ -100,30 +101,27 @@ hf auth login                            # or: export HF_TOKEN=hf_xxx
 
 ## 🛡️ YouTube on RunPod (no cookies needed)
 
-YouTube blocks datacenter IPs with **"Sign in to confirm you're not a bot"**. EGY-Emilia
-handles this **without cookies** using a PO-token provider
-([bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)),
-which makes yt-dlp's requests look like a real browser. Install it once:
+YouTube bot-checks datacenter IPs (**"Sign in to confirm you're not a bot"**). What gets through
+on RunPod is **plain yt-dlp**: no JavaScript runtime, so yt-dlp only uses the `visionos` player
+client, and no plugins. That is the default:
 
-```bash
-bash scripts/setup_pot_provider.sh     # Node 22 + plugin + token server into .tools/
+```yaml
+download:
+  js_runtime: false      # don't let yt-dlp use deno / web clients (those get bot-checked)
+  pot_provider: false    # don't load the bgutil PO-token plugin
 ```
 
-That's it. `python download.py` / `run_pipeline.py` **start and stop the token server
-automatically** (`✓ PO-token server started on :4416`). The stage also paces requests
-(`sleep_min_s` / `sleep_max_s`) and, after `bot_abort_after` consecutive bot blocks,
-**stops with instructions** instead of failing every remaining video. Finished videos
-are checkpointed, so re-running only fetches what's missing.
-
-Single-video links (`youtu.be/…`, `watch?v=…`) are parsed locally, so expanding them
-makes no request to YouTube.
+The download stage enforces this even when deno or the plugin is installed in the env. It also
+paces requests (`sleep_min_s` / `sleep_max_s`) and, after `bot_abort_after` consecutive bot
+blocks, **stops with instructions** instead of failing every remaining video. Finished videos are
+checkpointed. Single-video links are parsed locally, with no request to YouTube.
 
 ### If the pod's IP is still blocked
 
 PO tokens help a lot, but YouTube can still hard-block a particular datacenter IP. Fallbacks,
 none of which use cookies:
 
-0. **Find a player client that still works from this IP** (free, 1 minute):
+0. **Find a player client that still works from this IP** (free, 1 minute; tests with your config's settings):
    ```bash
    python scripts/diagnose_youtube.py
    ```
@@ -176,7 +174,22 @@ Then add your links to [`sources.txt`](sources.txt) (channels, playlists, or vid
 
 ## ▶️ Run
 
-**Whole pipeline (recommended):**
+**Notebook, recommended on RunPod:** [`pipeline.ipynb`](pipeline.ipynb)
+
+- **Part A** runs every stage on **one sample video** (in `sample/`, separate from the real data).
+  It then checks the results (24 kHz mono, chunk lengths, scores, filter, transcripts) and plays
+  kept and rejected chunks, so you can hear whether splitting, filtering and ASR are right.
+- **Part B** is the full run, **one cell per stage** (download → diarize → loudness → quality →
+  transcribe → summary → publish), each with its own progress. It won't start until Part A passes.
+
+Use the `egy` env as the kernel (one-time):
+```bash
+conda activate egy
+pip install ipykernel ipywidgets
+python -m ipykernel install --user --name egy --display-name "Python (egy)"
+```
+
+**Whole pipeline from the terminal:**
 ```bash
 python run_pipeline.py
 ```

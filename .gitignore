@@ -14,3 +14,4 @@ __pycache__/
 
 # PO-token server build (scripts/setup_pot_provider.sh)
 .tools/
+sample/
