@@ -142,8 +142,12 @@ def _start_pot_server(dl_cfg):
         if proc.poll() is not None:
             break
         time.sleep(0.5)
-    warn("PO-token server failed to start — see .tools/pot_server.log")
+    warn(f"PO-token server failed to start — last lines of {log_path}:")
     proc.terminate()
+    log.close()
+    for line in log_path.read_text(errors="ignore").splitlines()[-8:]:
+        note(escape(line))
+    note("rebuild it:  bash scripts/setup_pot_provider.sh")
     return None
 
 
