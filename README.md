@@ -74,7 +74,10 @@ conda create -n egy python=3.11 -y
 conda activate egy
 pip install --upgrade pip setuptools wheel
 
-# 2) PyTorch 2.7.1 + torchaudio (cu126)
+# 2) PyTorch 2.7.1 + torchaudio. Pick the index for your GPU:
+#    H100 / A100 / RTX 30xx-40xx      -> cu126
+#    Blackwell: RTX 50xx / B200 / RTX PRO 6000 -> cu128  (cu126 fails with
+#    "CUDA error: no kernel image is available for execution on the device")
 pip install torch==2.7.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu126
 
 # 3) pipeline deps
